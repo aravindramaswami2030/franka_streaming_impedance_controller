@@ -23,12 +23,32 @@ struct Pose {
 std::pair<double, double> poseDistance(const Pose& a, const Pose& b);
 
 /**
- * Piecewise-linear position / slerp orientation interpolation over absolutely-timed waypoints.
+ * Cubic-Hermite position / slerp orientation interpolation over absolutely-timed waypoints.
  *
- * Ported from UMI (upstream `PoseTrajectoryInterpolator`). The value here is not the interpolation
- * itself but `scheduleWaypoint`: it splices a future waypoint into a trajectory that is already
- * being consumed, without a discontinuity at the current instant. That is what lets action chunks
- * arriving at 10 Hz drive a 1 kHz loop that never stops between them.
+ * Originally ported from UMI (upstream `PoseTrajectoryInterpolator`) as plain lerp/slerp; position
+ * is now a monotone cubic Hermite spline instead. Lerp made the reference's velocity a step
+ * function — constant within a segment, discontinuous at every waypoint, roughly 10 times a
+ * second — which is a bounded-but-nonzero jerk at every knot regardless of chunk quality. The
+ * Hermite tangents (computeVelocities()) give each waypoint a shared slope between its incoming
+ * and outgoing segments, so velocity is continuous through interior knots and across
+ * `scheduleWaypoint` splices, not just position. Orientation is unchanged (still slerp); its
+ * angular velocity has the same discontinuity, left for a follow-up.
+ *
+ * The tangent at each interior waypoint is clamped to at most the smaller of its two neighboring
+ * secant speeds, and to zero at a local extremum. This is what keeps the spline from overshooting
+ * past its own waypoints, in position or in speed — the segment's *average* speed is already
+ * bounded by `scheduleWaypoint`'s max_pos_speed (see below), and an unclamped spline could
+ * still run locally faster than that average between two knots, which is exactly the distance
+ * that sets contact force. A bare two-waypoint trajectory has no interior knot to clamp, so its
+ * tangents both equal the one chord's slope and the curve degenerates to exactly the old lerp.
+ *
+ * The value here is not the interpolation itself but `scheduleWaypoint`: it splices a future
+ * waypoint into a trajectory that is already being consumed, without a discontinuity at the
+ * current instant. That is what lets action chunks arriving at 10 Hz drive a 1 kHz loop that never
+ * stops between them. Velocities are recomputed from scratch on every splice, which is also what
+ * makes the smoothing retroactive: a waypoint's tangent starts as a one-sided estimate (it has no
+ * "next" yet) and is corrected to the shared, clamped tangent the moment a further waypoint gives
+ * it one.
  *
  * Evaluation is allocation-free and safe to call from a realtime update(). Splicing is not — build
  * the new interpolator off the realtime thread and hand it over.
@@ -49,6 +69,9 @@ class PoseTrajectoryInterpolator {
   double firstTime() const { return times_.front(); }
   double lastTime() const { return times_.back(); }
   std::size_t size() const { return times_.size(); }
+
+  /// The velocity (m/s) the position spline was built to hit exactly at waypoint `i`.
+  const Eigen::Vector3d& velocityAt(std::size_t i) const { return velocities_.at(i); }
 
   /// The sub-trajectory spanning [start_t, end_t], with both endpoints materialised as waypoints.
   PoseTrajectoryInterpolator trim(double start_t, double end_t) const;
@@ -74,6 +97,10 @@ class PoseTrajectoryInterpolator {
  private:
   std::vector<double> times_;
   std::vector<Pose> poses_;
+  std::vector<Eigen::Vector3d> velocities_;
+
+  /// (Re)derive velocities_ from times_/poses_. Called once, by both constructors.
+  void computeVelocities();
 };
 
 }  // namespace franka_streaming_impedance

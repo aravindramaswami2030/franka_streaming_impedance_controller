@@ -92,10 +92,69 @@ TEST(PoseTrajectoryInterpolator, ScheduleWaypointSplicesWithoutDiscontinuity) {
   EXPECT_NEAR((after.position - before.position).norm(), 0.0, kTol);
   EXPECT_NEAR(after.orientation.angularDistance(before.orientation), 0.0, kTol);
 
-  // UMI's values for the spliced trajectory.
+  // Waypoint values are unaffected by the interpolation scheme (they are knots, not
+  // interpolated). t=11.0 is knot B; UMI's number for the tail knot at t=12.0 also still holds.
   expectPose(spliced(11.0), 1.0, 2.0, 3.0, 0.707106781187, 0.707106781187);
-  expectPose(spliced(11.5), 3.0, 1.0, 1.5, 0.382683432365, 0.923879532511);
   expectPose(spliced(12.0), 5.0, 0.0, 0.0, 0.0, 1.0);
+
+  // t=11.5 sits mid-segment, where the scheme does matter: knot B is now interior (bounded by
+  // knot A behind it and the fresh waypoint C ahead), so its tangent is monotoneTangent(secant
+  // A->B=(1,2,3), secant B->C=(4,-2,-3)) = (1,0,0) instead of UMI's discontinuous jump straight to
+  // secant B->C. That is what moves this point from UMI's lerp value (3.0, 1.0, 1.5) to the
+  // Hermite value below — orientation is untouched (still slerp), so its numbers are still UMI's.
+  expectPose(spliced(11.5), 2.625, 1.25, 1.875, 0.382683432365, 0.923879532511);
+}
+
+TEST(PoseTrajectoryInterpolator, VelocityIsContinuousAcrossASplice) {
+  // The property ScheduleWaypointSplicesWithoutDiscontinuity checks for position must also hold
+  // for velocity: the reference the controller was tracking up to curr_time=10.5, and the one it
+  // switches to from curr_time onward, must agree on which way it was moving at that instant.
+  const auto interp = twoWaypoints();
+  const auto spliced = interp.scheduleWaypoint(makePose(5, 0, 0, 0), 12.0, 10.5, 11.0, kInf, kInf);
+
+  // interp is a bare two-waypoint trajectory, so its velocity is one constant chord slope
+  // everywhere, including at curr_time. spliced's first knot is materialised at exactly that same
+  // instant by trim(), so comparing the two interpolators' analytic tangents there — rather than
+  // finite-differencing through operator(), which clamps outside each trajectory's own domain and
+  // would make a one-sided artifact look like a discontinuity — is the direct version of this
+  // check.
+  EXPECT_NEAR((spliced.velocityAt(0) - interp.velocityAt(0)).norm(), 0.0, kTol);
+}
+
+TEST(PoseTrajectoryInterpolator, RetroactiveSmoothingUpgradesTheNewestWaypointsTangent) {
+  // A waypoint's tangent starts as a one-sided estimate (it is the newest knot, with no "next"
+  // yet) and must be corrected once a further waypoint gives it a neighbor on both sides — that
+  // retroactive correction is what lets a stream of single-waypoint splices still end up
+  // C1-continuous everywhere, not just at the instant each waypoint was first added.
+  PoseTrajectoryInterpolator interp(10.0, makePose(0, 0, 0, 0));
+
+  // First splice: B is the newest waypoint, so its tangent is the one-sided secant A->B.
+  interp = interp.scheduleWaypoint(makePose(1, 0, 0, 0), 11.0, 10.0, 10.0, kInf, kInf);
+  EXPECT_NEAR((interp.velocityAt(1) - Eigen::Vector3d(1.0, 0.0, 0.0)).norm(), 0.0, kTol);
+
+  // Second splice, with curr_time=10.5 (strictly between A and B) so B survives the trim as a
+  // real interior knot rather than being discarded along with A: B is now straddled by A (secant
+  // +1/s) and the new waypoint C, whose secant runs backwards in x (-2/s) — opposite signs, so the
+  // monotone tangent at B must drop to zero instead of staying at the stale one-sided estimate.
+  interp = interp.scheduleWaypoint(makePose(-1, 0, 0, 0), 12.0, 10.5, 11.0, kInf, kInf);
+  ASSERT_EQ(interp.size(), 3u);
+  EXPECT_NEAR(interp.velocityAt(1).norm(), 0.0, kTol);
+}
+
+TEST(PoseTrajectoryInterpolator, DoesNotOvershootPastItsWaypoints) {
+  // The failure mode an unclamped Catmull-Rom/Hermite spline is prone to: swinging past a knot's
+  // own neighbors on the way through it. Each waypoint here backtracks in x, which is exactly the
+  // shape (a local extremum at the interior knot) that must clamp to a zero tangent and hug the
+  // path instead of bulging outward.
+  const PoseTrajectoryInterpolator interp(
+      {0.0, 1.0, 2.0, 3.0},
+      {makePose(0, 0, 0, 0), makePose(1, 0, 0, 0), makePose(0.5, 0, 0, 0), makePose(1.5, 0, 0, 0)});
+
+  for (double t = 0.0; t <= 3.0; t += 0.01) {
+    const double x = interp(t).position.x();
+    EXPECT_GE(x, -kTol) << "undershot below the path's minimum at t=" << t;
+    EXPECT_LE(x, 1.5 + kTol) << "overshot past the path's maximum at t=" << t;
+  }
 }
 
 TEST(PoseTrajectoryInterpolator, WaypointInThePastIsIgnored) {
