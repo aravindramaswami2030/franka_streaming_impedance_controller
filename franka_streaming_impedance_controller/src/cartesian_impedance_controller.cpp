@@ -312,6 +312,11 @@ CallbackReturn CartesianImpedanceController::on_activate(
 
   position_interfaces_.clear();
   velocity_interfaces_.clear();
+  // ros2_control from Jazzy on refuses to grow these inside get_ordered_interfaces ("Capacity of
+  // ordered_interfaces (0) has to be equal or higher as size of ordered_names ... for realtime
+  // reasons") and the activation fails; Humble grew them silently. Reserving is a no-op there.
+  position_interfaces_.reserve(joint_names_.size());
+  velocity_interfaces_.reserve(joint_names_.size());
   if (!controller_interface::get_ordered_interfaces(state_interfaces_, joint_names_,
                                                     hardware_interface::HW_IF_POSITION,
                                                     position_interfaces_) ||
