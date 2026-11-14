@@ -25,30 +25,20 @@ std::pair<double, double> poseDistance(const Pose& a, const Pose& b);
 /**
  * Cubic-Hermite position / slerp orientation interpolation over absolutely-timed waypoints.
  *
- * Originally ported from UMI (upstream `PoseTrajectoryInterpolator`) as plain lerp/slerp; position
- * is now a monotone cubic Hermite spline instead. Lerp made the reference's velocity a step
- * function — constant within a segment, discontinuous at every waypoint, roughly 10 times a
- * second — which is a bounded-but-nonzero jerk at every knot regardless of chunk quality. The
- * Hermite tangents (computeVelocities()) give each waypoint a shared slope between its incoming
- * and outgoing segments, so velocity is continuous through interior knots and across
- * `scheduleWaypoint` splices, not just position. Orientation is unchanged (still slerp); its
- * angular velocity has the same discontinuity, left for a follow-up.
+ * This uses a monotone cubic Hermite spline instead, so velocity is continuous through interior
+ * waypoints rather than stepping at each one. Orientation is still slerp, and its angular
+ * velocity still steps.
  *
- * The tangent at each interior waypoint is clamped to at most the smaller of its two neighboring
- * secant speeds, and to zero at a local extremum. This is what keeps the spline from overshooting
- * past its own waypoints, in position or in speed — the segment's *average* speed is already
- * bounded by `scheduleWaypoint`'s max_pos_speed (see below), and an unclamped spline could
- * still run locally faster than that average between two knots, which is exactly the distance
- * that sets contact force. A bare two-waypoint trajectory has no interior knot to clamp, so its
- * tangents both equal the one chord's slope and the curve degenerates to exactly the old lerp.
+ * Interior tangents (see `computeVelocities`) are clamped to the smaller of the two neighbouring
+ * secant speeds, and to zero at a local extremum, which stops the spline overshooting its own
+ * waypoints in position or in peak speed. A two-waypoint trajectory has no interior knot, so it
+ * degenerates to exactly the old lerp.
  *
  * The value here is not the interpolation itself but `scheduleWaypoint`: it splices a future
  * waypoint into a trajectory that is already being consumed, without a discontinuity at the
  * current instant. That is what lets action chunks arriving at 10 Hz drive a 1 kHz loop that never
- * stops between them. Velocities are recomputed from scratch on every splice, which is also what
- * makes the smoothing retroactive: a waypoint's tangent starts as a one-sided estimate (it has no
- * "next" yet) and is corrected to the shared, clamped tangent the moment a further waypoint gives
- * it one.
+ * stops between them. Tangents are recomputed on every splice, so a waypoint added with no
+ * successor is corrected once a later one gives it a neighbour on both sides.
  *
  * Evaluation is allocation-free and safe to call from a realtime update(). Splicing is not — build
  * the new interpolator off the realtime thread and hand it over.

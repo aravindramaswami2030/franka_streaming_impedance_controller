@@ -1,9 +1,10 @@
 // Copyright (c) 2026 the franka_streaming_impedance_controller authors. MIT.
 //
 // Every expected value here was produced by RUNNING UMI's own implementation
-// (../universal_manipulation_interface/umi/common/pose_trajectory_interpolator.py) on the same
+// (umi/common/pose_trajectory_interpolator.py, in universal_manipulation_interface) on the same
 // inputs and pasting what it printed. That is the point: a port checked against itself only
-// proves it is self-consistent. See the plan's verification section for the generator snippet.
+// proves it is self-consistent. Where this port deliberately differs -- position is Hermite, not
+// lerp -- the assertion that moved says so, and why.
 
 #include <franka_streaming_impedance_controller/pose_trajectory_interpolator.hpp>
 
@@ -92,40 +93,32 @@ TEST(PoseTrajectoryInterpolator, ScheduleWaypointSplicesWithoutDiscontinuity) {
   EXPECT_NEAR((after.position - before.position).norm(), 0.0, kTol);
   EXPECT_NEAR(after.orientation.angularDistance(before.orientation), 0.0, kTol);
 
-  // Waypoint values are unaffected by the interpolation scheme (they are knots, not
-  // interpolated). t=11.0 is knot B; UMI's number for the tail knot at t=12.0 also still holds.
+  // Knots are not interpolated, so UMI's values still hold at t=11.0 (knot B) and t=12.0.
   expectPose(spliced(11.0), 1.0, 2.0, 3.0, 0.707106781187, 0.707106781187);
   expectPose(spliced(12.0), 5.0, 0.0, 0.0, 0.0, 1.0);
 
-  // t=11.5 sits mid-segment, where the scheme does matter: knot B is now interior (bounded by
-  // knot A behind it and the fresh waypoint C ahead), so its tangent is monotoneTangent(secant
-  // A->B=(1,2,3), secant B->C=(4,-2,-3)) = (1,0,0) instead of UMI's discontinuous jump straight to
-  // secant B->C. That is what moves this point from UMI's lerp value (3.0, 1.0, 1.5) to the
-  // Hermite value below — orientation is untouched (still slerp), so its numbers are still UMI's.
+  // Mid-segment the scheme does matter. B is now interior, so its tangent is
+  // monotoneTangent((1,2,3), (4,-2,-3)) = (1,0,0) rather than the secant B->C that lerp would
+  // jump to, moving this point off UMI's (3.0, 1.0, 1.5). Orientation is still slerp.
   expectPose(spliced(11.5), 2.625, 1.25, 1.875, 0.382683432365, 0.923879532511);
 }
 
 TEST(PoseTrajectoryInterpolator, VelocityIsContinuousAcrossASplice) {
-  // The property ScheduleWaypointSplicesWithoutDiscontinuity checks for position must also hold
-  // for velocity: the reference the controller was tracking up to curr_time=10.5, and the one it
-  // switches to from curr_time onward, must agree on which way it was moving at that instant.
+  // The continuity ScheduleWaypointSplicesWithoutDiscontinuity checks for position must hold for
+  // velocity too: the old and new references must agree on direction at the splice instant.
   const auto interp = twoWaypoints();
   const auto spliced = interp.scheduleWaypoint(makePose(5, 0, 0, 0), 12.0, 10.5, 11.0, kInf, kInf);
 
-  // interp is a bare two-waypoint trajectory, so its velocity is one constant chord slope
-  // everywhere, including at curr_time. spliced's first knot is materialised at exactly that same
-  // instant by trim(), so comparing the two interpolators' analytic tangents there — rather than
-  // finite-differencing through operator(), which clamps outside each trajectory's own domain and
-  // would make a one-sided artifact look like a discontinuity — is the direct version of this
-  // check.
+  // Both have a knot at curr_time (trim() materialises one), so compare analytic tangents there.
+  // Finite-differencing through operator() would clamp outside each domain and show a false
+  // discontinuity.
   EXPECT_NEAR((spliced.velocityAt(0) - interp.velocityAt(0)).norm(), 0.0, kTol);
 }
 
 TEST(PoseTrajectoryInterpolator, RetroactiveSmoothingUpgradesTheNewestWaypointsTangent) {
-  // A waypoint's tangent starts as a one-sided estimate (it is the newest knot, with no "next"
-  // yet) and must be corrected once a further waypoint gives it a neighbor on both sides — that
-  // retroactive correction is what lets a stream of single-waypoint splices still end up
-  // C1-continuous everywhere, not just at the instant each waypoint was first added.
+  // The newest knot's tangent is one-sided until a later waypoint gives it a neighbour on both
+  // sides. That retroactive correction is what keeps a stream of single-waypoint splices
+  // C1-continuous throughout, not just where each waypoint was added.
   PoseTrajectoryInterpolator interp(10.0, makePose(0, 0, 0, 0));
 
   // First splice: B is the newest waypoint, so its tangent is the one-sided secant A->B.
