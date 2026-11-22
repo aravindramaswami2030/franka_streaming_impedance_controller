@@ -1,15 +1,12 @@
 // Copyright (c) 2026 the franka_streaming_impedance_controller authors. MIT.
 //
-// Every expected value here was produced by RUNNING UMI's own implementation
-// (umi/common/pose_trajectory_interpolator.py, in universal_manipulation_interface) on the same
-// inputs and pasting what it printed. That is the point: a port checked against itself only
-// proves it is self-consistent. Where this port deliberately differs -- position is Hermite, not
-// lerp -- the assertion that moved says so, and why.
+// UMI reference values for unchanged behavior, plus position, continuity and speed regressions.
 
 #include <franka_streaming_impedance_controller/pose_trajectory_interpolator.hpp>
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 
@@ -45,6 +42,11 @@ void expectPose(const Pose& got, double x, double y, double z, double qz, double
 PoseTrajectoryInterpolator twoWaypoints() {
   return PoseTrajectoryInterpolator({10.0, 11.0},
                                     {makePose(0, 0, 0, 0), makePose(1, 2, 3, M_PI / 2)});
+}
+
+Eigen::Vector3d positionVelocity(const PoseTrajectoryInterpolator& interp, double t) {
+  constexpr double dt = 1e-6;
+  return (interp(t + dt).position - interp(t - dt).position) / (2.0 * dt);
 }
 
 }  // namespace
@@ -97,44 +99,20 @@ TEST(PoseTrajectoryInterpolator, ScheduleWaypointSplicesWithoutDiscontinuity) {
   expectPose(spliced(11.0), 1.0, 2.0, 3.0, 0.707106781187, 0.707106781187);
   expectPose(spliced(12.0), 5.0, 0.0, 0.0, 0.0, 1.0);
 
-  // Mid-segment the scheme does matter. B is now interior, so its tangent is
-  // monotoneTangent((1,2,3), (4,-2,-3)) = (1,0,0) rather than the secant B->C that lerp would
-  // jump to, moving this point off UMI's (3.0, 1.0, 1.5). Orientation is still slerp.
-  expectPose(spliced(11.5), 2.625, 1.25, 1.875, 0.382683432365, 0.923879532511);
+  // B retains its incoming velocity (1,2,3), while the new segment exits at (4,-2,-3).
+  expectPose(spliced(11.5), 2.625, 1.5, 2.25, 0.382683432365, 0.923879532511);
 }
 
-TEST(PoseTrajectoryInterpolator, VelocityIsContinuousAcrossASplice) {
-  // The continuity ScheduleWaypointSplicesWithoutDiscontinuity checks for position must hold for
-  // velocity too: the old and new references must agree on direction at the splice instant.
-  const auto interp = twoWaypoints();
-  const auto spliced = interp.scheduleWaypoint(makePose(5, 0, 0, 0), 12.0, 10.5, 11.0, kInf, kInf);
-
-  // Both have a knot at curr_time (trim() materialises one), so compare analytic tangents there.
-  // Finite-differencing through operator() would clamp outside each domain and show a false
-  // discontinuity.
-  EXPECT_NEAR((spliced.velocityAt(0) - interp.velocityAt(0)).norm(), 0.0, kTol);
-}
-
-TEST(PoseTrajectoryInterpolator, RetroactiveSmoothingUpgradesTheNewestWaypointsTangent) {
-  // The newest knot's tangent is one-sided until a later waypoint gives it a neighbour on both
-  // sides. That retroactive correction is what keeps a stream of single-waypoint splices
-  // C1-continuous throughout, not just where each waypoint was added.
+TEST(PoseTrajectoryInterpolator, AppendPreservesTheAlreadyPlannedCurve) {
   PoseTrajectoryInterpolator interp(10.0, makePose(0, 0, 0, 0));
-
-  // First splice: B is the newest waypoint, so its tangent is the one-sided secant A->B.
   interp = interp.scheduleWaypoint(makePose(1, 0, 0, 0), 11.0, 10.0, 10.0, kInf, kInf);
-  EXPECT_NEAR((interp.velocityAt(1) - Eigen::Vector3d(1.0, 0.0, 0.0)).norm(), 0.0, kTol);
-
-  // Second splice, with curr_time=10.5 (strictly between A and B) so B survives the trim as a
-  // real interior knot rather than being discarded along with A: B is now straddled by A (secant
-  // +1/s) and the new waypoint C, whose secant runs backwards in x (-2/s) — opposite signs, so the
-  // monotone tangent at B must drop to zero instead of staying at the stale one-sided estimate.
-  interp = interp.scheduleWaypoint(makePose(-1, 0, 0, 0), 12.0, 10.5, 11.0, kInf, kInf);
-  ASSERT_EQ(interp.size(), 3u);
-  EXPECT_NEAR(interp.velocityAt(1).norm(), 0.0, kTol);
+  const auto appended = interp.scheduleWaypoint(makePose(-1, 0, 0, 0), 12.0, 10.5, 11.0, kInf, kInf);
+  for (double t = 10.5; t <= 11.0; t += 0.025) {
+    EXPECT_NEAR((appended(t).position - interp(t).position).norm(), 0.0, kTol);
+  }
 }
 
-TEST(PoseTrajectoryInterpolator, DoesNotOvershootPastItsWaypoints) {
+TEST(PoseTrajectoryInterpolator, BatchConstructorDoesNotOvershootPastItsWaypoints) {
   // The failure mode an unclamped Catmull-Rom/Hermite spline is prone to: swinging past a knot's
   // own neighbors on the way through it. Each waypoint here backtracks in x, which is exactly the
   // shape (a local extremum at the interior knot) that must clamp to a zero tangent and hug the
@@ -163,9 +141,7 @@ TEST(PoseTrajectoryInterpolator, WaypointInThePastIsIgnored) {
 }
 
 TEST(PoseTrajectoryInterpolator, SpeedLimitStretchesTheSegment) {
-  // 10 m away at 1 m/s cannot be reached in the 0.5 s requested, so the waypoint moves out to
-  // t=21.0 instead of the reference sprinting there. This is the bound on how far the equilibrium
-  // point can lead the arm, which is the bound on impedance force.
+  // The 10 m displacement needs at least 10 s at the requested 1 m/s exit-speed limit.
   const auto interp = twoWaypoints();
 
   const auto limited =
@@ -212,11 +188,14 @@ TEST(PoseTrajectoryInterpolator, SpeedLimitedChunkKeepsItsPathShape) {
     last_waypoint = target;
   }
 
-  // The leading leg is pure +x: the limiter stretched it, it was not discarded.
-  EXPECT_NEAR(interp(0.25).position.x(), 0.25, 1e-3);
-  EXPECT_NEAR(interp(0.25).position.y(), 0.0, 1e-6);
-  EXPECT_NEAR(interp(0.50).position.x(), 0.50, 1e-3);
-  EXPECT_NEAR(interp(0.50).position.y(), 0.0, 1e-6);
+  // The leading leg stays on +x and starts from rest instead of instantly reaching the cap.
+  for (const double t : {0.25, 0.5}) {
+    EXPECT_GT(interp(t).position.x(), 0.0);
+    EXPECT_LE(interp(t).position.x(), t + kTol);
+    EXPECT_NEAR(interp(t).position.y(), 0.0, 1e-6);
+    EXPECT_LE(positionVelocity(interp, t).norm(), 1.0 + 1e-8);
+  }
+  EXPECT_GT(interp(0.5).position.x(), interp(0.25).position.x());
 
   // It still arrives at the chunk's final pose, and holds there.
   EXPECT_NEAR(interp(interp.lastTime()).position.x(), 1.5, kTol);
@@ -224,8 +203,7 @@ TEST(PoseTrajectoryInterpolator, SpeedLimitedChunkKeepsItsPathShape) {
 }
 
 TEST(PoseTrajectoryInterpolator, SpeedLimitBoundsReferenceSpeedButNotItsLag) {
-  // What the limit does and does not buy. It caps how fast the equilibrium point may TRAVEL, which
-  // is what bounds contact force. It does NOT cap how far behind the policy the reference may fall:
+  // The speed limit does not cap how far behind the policy the reference may fall:
   // a stream commanding 1.5 m/s against a 1.0 m/s limit accumulates the 0.5 m/s deficit forever, so
   // the trajectory's tail runs ever further into the future and the arm keeps crawling toward a
   // stale target long after the policy has stopped.
@@ -269,11 +247,6 @@ TEST(PoseTrajectoryInterpolator, RepeatedSplicesDoNotGrowTheTrajectory) {
   // a subscription callback that also frees the previous trajectory. The trim window is what keeps
   // that bounded: it discards whatever curr_time has passed, so the knot count settles instead of
   // tracking the episode's length.
-  //
-  // Coincident knots — what scipy raises on in UMI — are not checked here because they cannot
-  // arise: trim's interior filter is strict and the new waypoint's duration is always positive, so
-  // the knots are strictly increasing by construction. See the note on the pop-back guard in
-  // scheduleWaypoint.
   auto interp = twoWaypoints();
 
   for (int i = 0; i < 200; ++i) {
@@ -283,4 +256,133 @@ TEST(PoseTrajectoryInterpolator, RepeatedSplicesDoNotGrowTheTrajectory) {
     ASSERT_LE(interp.size(), 8u) << "spliced trajectory is growing without bound";
   }
   EXPECT_GT(interp.size(), 1u) << "test is vacuous if the splices are not landing";
+}
+
+TEST(PoseTrajectoryInterpolator, ReversingWaypointsRespectTheEuclideanSpeedLimit) {
+  constexpr double max_speed = 0.1;
+  for (const Eigen::Vector3d& direction :
+       {Eigen::Vector3d(1, 0, 0), Eigen::Vector3d(1, 2, -2).normalized()}) {
+    PoseTrajectoryInterpolator interp(0.0, makePose(0, 0, 0, 0));
+    for (int i = 1; i <= 3; ++i) {
+      Pose target;
+      target.position = (i % 2) * 0.1 * direction;
+      interp = interp.scheduleWaypoint(target, i, 0.0, i - 1, max_speed, kInf);
+    }
+    ASSERT_GT(interp.lastTime(), 0.0);
+    EXPECT_NEAR((interp(interp.lastTime()).position - 0.1 * direction).norm(), 0.0, kTol);
+    double peak_speed = 0.0;
+    for (int i = 1; i < 2000; ++i) {
+      peak_speed = std::max(peak_speed, positionVelocity(interp, interp.lastTime() * i / 2000).norm());
+    }
+    EXPECT_LE(peak_speed, max_speed + 1e-8);
+  }
+}
+
+TEST(PoseTrajectoryInterpolator, TrimPreservesNonlinearPositionAndVelocity) {
+  const PoseTrajectoryInterpolator interp(
+      {0.0, 1.0, 2.0, 3.0},
+      {makePose(0, 0, 0, 0), makePose(0.1, -0.03, 0, 0),
+       makePose(0, 0.07, 0, 0), makePose(0.1, 0.02, 0, 0)});
+  const auto trimmed = interp.trim(0.25, 2.75);
+  double position_error = 0.0;
+  double velocity_error = 0.0;
+  for (int i = 0; i <= 24; ++i) {
+    const double t = 0.3 + i * 0.1;
+    position_error = std::max(position_error, (trimmed(t).position - interp(t).position).norm());
+    velocity_error = std::max(velocity_error,
+                             (positionVelocity(trimmed, t) - positionVelocity(interp, t)).norm());
+  }
+  EXPECT_LE(position_error, 1e-12);
+  EXPECT_LE(velocity_error, 1e-8);
+}
+
+TEST(PoseTrajectoryInterpolator, AppendPreservesLiveVelocityInsideACurvedSegment) {
+  const PoseTrajectoryInterpolator interp(
+      {0.0, 1.0, 2.0, 3.0},
+      {makePose(0, 0, 0, 0), makePose(0.1, 0, 0, 0),
+       makePose(0, 0, 0, 0), makePose(0.1, 0, 0, 0)});
+  constexpr double now = 0.5;
+  constexpr double dt = 1e-6;
+  const auto appended = interp.scheduleWaypoint(makePose(0.2, 0, 0, 0), 4.0, now, 3.0, 0.2, kInf);
+  const Eigen::Vector3d before = (interp(now).position - interp(now - dt).position) / dt;
+  const Eigen::Vector3d after = (appended(now + dt).position - appended(now).position) / dt;
+  EXPECT_NEAR((appended(now).position - interp(now).position).norm(), 0.0, kTol);
+  EXPECT_LE((after - before).norm(), 1e-6);
+}
+
+TEST(PoseTrajectoryInterpolator, RepeatedTrimPreservesMotionAndClampedHolds) {
+  const PoseTrajectoryInterpolator interp(
+      {0.0, 1.0, 2.0},
+      {makePose(0, 0, 0, 0), makePose(0.1, 0.1, 0, 0), makePose(0.3, 0, 0, 0)});
+  const auto extended = interp.trim(-1.0, 3.0);
+  const auto trimmed = extended.trim(-0.75, 2.75);
+  for (const double t : {-0.5, 0.0, 0.5, 1.0, 1.5, 2.0, 2.5}) {
+    EXPECT_NEAR((extended(t).position - interp(t).position).norm(), 0.0, kTol);
+    EXPECT_NEAR((trimmed(t).position - interp(t).position).norm(), 0.0, kTol);
+  }
+  for (const double t : {-0.5, 0.5, 1.5, 2.5}) {
+    EXPECT_LE((positionVelocity(trimmed, t) - positionVelocity(interp, t)).norm(), 1e-8);
+  }
+}
+
+TEST(PoseTrajectoryInterpolator, LoweredSpeedLimitPreservesEntryAndLimitsExit) {
+  const PoseTrajectoryInterpolator interp({0.0, 2.0},
+                                         {makePose(0, 0, 0, 0), makePose(0.4, 0, 0, 0)});
+  constexpr double now = 0.5;
+  constexpr double dt = 1e-6;
+  const auto slowed = interp.scheduleWaypoint(makePose(0.3, 0, 0, 0), 1.0, now, 2.0, 0.05, kInf);
+  EXPECT_NEAR((slowed(now + dt).position - slowed(now).position).x() / dt, 0.2, 1e-6);
+  for (int i = 1; i < 100; ++i) {
+    const double t = now + (slowed.lastTime() - now) * i / 100;
+    EXPECT_LE(positionVelocity(slowed, t).norm(), 0.2 + 1e-8);
+  }
+  const double end = slowed.lastTime();
+  EXPECT_LE((slowed(end).position - slowed(end - dt).position).norm() / dt, 0.05 + 1e-6);
+}
+
+TEST(PoseTrajectoryInterpolator, SamePositionTargetPreservesEntryAndComesToRest) {
+  const PoseTrajectoryInterpolator interp({0.0, 2.0},
+                                         {makePose(0, 0, 0, 0), makePose(0.4, 0.2, 0, 0)});
+  constexpr double now = 0.5;
+  constexpr double dt = 1e-6;
+  const auto stopped = interp.scheduleWaypoint(interp(now), 1.5, now, 2.0, 0.3, kInf);
+  const Eigen::Vector3d entry = (stopped(now + dt).position - stopped(now).position) / dt;
+  EXPECT_LE((entry - positionVelocity(interp, now)).norm(), 1e-6);
+  const double end = stopped.lastTime();
+  EXPECT_NEAR((stopped(end).position - interp(now).position).norm(), 0.0, kTol);
+  EXPECT_LE((stopped(end).position - stopped(end - dt).position).norm() / dt, 1e-6);
+}
+
+TEST(PoseTrajectoryInterpolator, ReplansAtTheSameInstantPreserveNonzeroEntryVelocity) {
+  const PoseTrajectoryInterpolator interp({0.0, 2.0},
+                                         {makePose(0, 0, 0, 0), makePose(0.4, 0, 0, 0)});
+  constexpr double now = 0.5;
+  constexpr double dt = 1e-6;
+  const auto first = interp.scheduleWaypoint(makePose(0.3, 0, 0, 0), 1.2, now, 2.0, 0.3, kInf);
+  const auto second = first.scheduleWaypoint(makePose(0.2, 0, 0, 0), 1.0, now, 1.2, 0.3, kInf);
+  EXPECT_DOUBLE_EQ(first.firstTime(), now);
+  EXPECT_DOUBLE_EQ(second.firstTime(), now);
+  EXPECT_NEAR((second(now).position - interp(now).position).norm(), 0.0, kTol);
+  EXPECT_NEAR((second(now + dt).position - second(now).position).x() / dt, 0.2, 1e-6);
+}
+
+TEST(PoseTrajectoryInterpolator, ExtendingASinglePointTrimPreservesItsHold) {
+  const PoseTrajectoryInterpolator interp({0.0, 2.0},
+                                         {makePose(0, 0, 0, 0), makePose(0.2, 0, 0, 0)});
+  const auto point = interp.trim(1.0, 1.0);
+  const auto extended = point.trim(1.0, 2.0);
+  for (const double t : {1.0, 1.25, 1.5, 1.75, 2.0}) {
+    EXPECT_NEAR((extended(t).position - point(t).position).norm(), 0.0, kTol);
+  }
+}
+
+TEST(PoseTrajectoryInterpolator, ReplanningAtAClampBoundaryPreservesIncomingVelocity) {
+  const PoseTrajectoryInterpolator interp({0.0, 2.0},
+                                         {makePose(0, 0, 0, 0), makePose(0.2, 0, 0, 0)});
+  const auto held = interp.trim(-1.0, 3.0);
+  const auto replanned = held.scheduleWaypoint(makePose(0.3, 0, 0, 0), 2.5, 2.0, 3.0, 0.5, kInf);
+  constexpr double dt = 1e-6;
+  const Eigen::Vector3d before = (held(2.0).position - held(2.0 - dt).position) / dt;
+  const Eigen::Vector3d after = (replanned(2.0 + dt).position - replanned(2.0).position) / dt;
+  EXPECT_LE((after - before).norm(), 1e-6);
 }

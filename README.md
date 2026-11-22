@@ -80,11 +80,13 @@ both moved onto it at activation with one TF lookup. (`SetTCPFrame` is not the l
 `ControllerMode::kJointImpedance` — stiffness-only, no damping knob — and hardcodes its rate
 limiter and low-pass filter off, so nothing downstream catches a discontinuity either.
 
-**Position is a cubic Hermite spline, not lerp**, which is what makes "neither starts from rest nor
-stops at a chunk boundary" true of *velocity*. Each waypoint gets one shared slope between its incoming and outgoing segments, so the reference's velocity is continuous
-through interior waypoints and across splices. Tangents are clamped monotone, so the spline cannot
-locally outrun the average speed `max_pos_speed` already bounds — and that distance is what sets
-contact force. Orientation is still slerp, so its angular velocity still steps at each waypoint. Position is continous for both linear and orientation controllers. 
+**Position uses cubic Hermite interpolation.** Splices preserve the retained curve and its
+velocity; each new segment inherits that velocity and ends at its own average velocity.
+Its duration bounds the spline's peak speed. Lowering `max_pos_speed` below the current reference
+speed preserves that entry speed during the transition and meets the new limit at the endpoint.
+Reversals and repeated-position targets can briefly carry the reference past the waypoints:
+this is a speed bound, not a spatial or acceleration bound. Orientation remains slerp, and both
+angular velocity at waypoints and linear velocity on entering the final hold can still step.
 
 ## `franka_hand_node`
 

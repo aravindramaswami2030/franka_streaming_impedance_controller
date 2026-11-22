@@ -8,10 +8,7 @@
 
 namespace {
 
-/// A monotone tangent for the knot between secant_prev (incoming) and secant_next (outgoing),
-/// per position axis: zero at a local extremum, otherwise sign-consistent with both secants and
-/// capped at the smaller of their magnitudes. This is what stops the Hermite spline overshooting
-/// past its own waypoints — in position, and in the peak speed between two knots.
+/// Shape-preserving tangents for a trajectory constructed from a complete set of waypoints.
 Eigen::Vector3d monotoneTangent(const Eigen::Vector3d& secant_prev,
                                 const Eigen::Vector3d& secant_next) {
   Eigen::Vector3d out;
@@ -22,9 +19,7 @@ Eigen::Vector3d monotoneTangent(const Eigen::Vector3d& secant_prev,
       out(i) = 0.0;
       continue;
     }
-    const double avg = 0.5 * (a + b);
-    const double bound = std::min(std::abs(a), std::abs(b));
-    out(i) = std::copysign(std::min(std::abs(avg), bound), avg);
+    out(i) = std::copysign(std::min(std::abs(a), std::abs(b)), a);
   }
   return out;
 }
@@ -115,29 +110,51 @@ Pose PoseTrajectoryInterpolator::operator()(double t) const {
 }
 
 PoseTrajectoryInterpolator PoseTrajectoryInterpolator::trim(double start_t, double end_t) const {
-  std::vector<double> times;
-  std::vector<Pose> poses;
-  times.reserve(times_.size() + 2);
-  poses.reserve(times_.size() + 2);
-
-  // start_t and end_t become real waypoints; interior ones are kept, and the strict inequalities
-  // are what stop either endpoint being added twice.
-  const auto push = [&](double t) {
-    if (times.empty() || t > times.back()) {
-      times.push_back(t);
-      poses.push_back((*this)(t));
-    }
+  auto result = *this;
+  result.times_.clear();
+  result.poses_.clear();
+  result.velocities_.clear();
+  const auto push = [&](double t, const Pose& pose, const Eigen::Vector3d& velocity) {
+    result.times_.push_back(t);
+    result.poses_.push_back(pose);
+    result.velocities_.push_back(velocity);
   };
 
-  push(start_t);
-  for (const double t : times_) {
-    if (t > start_t && t < end_t) {
-      push(t);
+  // A Hermite sub-segment needs the original derivatives as well as its endpoint positions.
+  // A point splice uses incoming velocity; at the first knot, retain the existing outgoing one.
+  push(start_t, (*this)(start_t), velocity(start_t, start_t == end_t && start_t > firstTime()));
+  if (start_t < firstTime() && firstTime() < end_t) {
+    push(firstTime(), poses_.front(), Eigen::Vector3d::Zero());
+  }
+  for (std::size_t i = 0; i < times_.size(); ++i) {
+    if (times_[i] > start_t && times_[i] < end_t) {
+      push(times_[i], poses_[i], velocities_[i]);
     }
   }
-  push(end_t);
+  // Duplicate boundary knots retain the jump to/from a clamped, zero-velocity hold.
+  if (start_t < lastTime() && lastTime() < end_t) {
+    push(lastTime(), poses_.back(), Eigen::Vector3d::Zero());
+  }
+  if (end_t > start_t) {
+    push(end_t, (*this)(end_t), velocity(end_t, true));
+  }
 
-  return PoseTrajectoryInterpolator(std::move(times), std::move(poses));
+  return result;
+}
+
+Eigen::Vector3d PoseTrajectoryInterpolator::velocity(double t, bool from_left) const {
+  const auto upper = from_left ? std::lower_bound(times_.begin(), times_.end(), t)
+                               : std::upper_bound(times_.begin(), times_.end(), t);
+  if (upper == times_.begin() || upper == times_.end()) {
+    return Eigen::Vector3d::Zero();
+  }
+  const std::size_t hi = static_cast<std::size_t>(upper - times_.begin());
+  const std::size_t lo = hi - 1;
+  const double span = times_[hi] - times_[lo];
+  const double s = (t - times_[lo]) / span;
+  return 6.0 * s * (1.0 - s) / span * (poses_[hi].position - poses_[lo].position) +
+         (3.0 * s * s - 4.0 * s + 1.0) * velocities_[lo] +
+         (3.0 * s * s - 2.0 * s) * velocities_[hi];
 }
 
 PoseTrajectoryInterpolator PoseTrajectoryInterpolator::scheduleWaypoint(const Pose& pose,
@@ -162,28 +179,27 @@ PoseTrajectoryInterpolator PoseTrajectoryInterpolator::scheduleWaypoint(const Po
 
   PoseTrajectoryInterpolator trimmed = trim(start_time, end_time);
 
-  // Stretch the segment if arriving on time would exceed either speed limit.
   const Pose end_pose = trimmed(end_time);
   const auto [pos_dist, rot_dist] = poseDistance(pose, end_pose);
-  const double duration = std::max({time - end_time, pos_dist / max_pos_speed,
-                                    rot_dist / max_rot_speed});
-  const double new_waypoint_time = end_time + duration;
-
-  std::vector<double> times = trimmed.times_;
-  std::vector<Pose> poses = trimmed.poses_;
-  // Belt and braces, and currently unreachable: trim() always ends exactly at end_time, and
-  // duration is at least `time - end_time` which is strictly positive, so new_waypoint_time is
-  // always past the last knot. Kept because the constructor THROWS on non-increasing times and
-  // this runs in a subscription callback — if the min/max sequence above is ever rearranged, this
-  // is what turns a crash into a dropped point.
-  while (!times.empty() && times.back() >= new_waypoint_time) {
-    times.pop_back();
-    poses.pop_back();
+  const Eigen::Vector3d displacement = pose.position - end_pose.position;
+  const Eigen::Vector3d entry_velocity = trimmed.velocities_.back();
+  double duration = std::max({time - end_time, pos_dist / max_pos_speed,
+                             rot_dist / max_rot_speed});
+  if (pos_dist > 0.0 && std::isfinite(max_pos_speed)) {
+    // With exit velocity d/T, the exact peak speed is max(|v0|, |4d/T - v0|/3).
+    // A lowered limit cannot erase entry velocity; the secant bound above limits exit speed.
+    const double limit = std::max(max_pos_speed, entry_velocity.norm());
+    const double projection = displacement.dot(entry_velocity) / pos_dist;
+    const double min_duration = 4.0 * pos_dist /
+        (std::sqrt(projection * projection + 9.0 * limit * limit -
+                   entry_velocity.squaredNorm()) + projection);
+    duration = std::max(duration, min_duration);
   }
-  times.push_back(new_waypoint_time);
-  poses.push_back(pose);
 
-  return PoseTrajectoryInterpolator(std::move(times), std::move(poses));
+  trimmed.times_.push_back(end_time + duration);
+  trimmed.poses_.push_back(pose);
+  trimmed.velocities_.push_back(displacement / duration);
+  return trimmed;
 }
 
 }  // namespace franka_streaming_impedance

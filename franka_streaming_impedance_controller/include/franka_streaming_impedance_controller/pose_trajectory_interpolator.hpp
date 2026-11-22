@@ -25,20 +25,10 @@ std::pair<double, double> poseDistance(const Pose& a, const Pose& b);
 /**
  * Cubic-Hermite position / slerp orientation interpolation over absolutely-timed waypoints.
  *
- * This uses a monotone cubic Hermite spline instead, so velocity is continuous through interior
- * waypoints rather than stepping at each one. Orientation is still slerp, and its angular
- * velocity still steps.
- *
- * Interior tangents (see `computeVelocities`) are clamped to the smaller of the two neighbouring
- * secant speeds, and to zero at a local extremum, which stops the spline overshooting its own
- * waypoints in position or in peak speed. A two-waypoint trajectory has no interior knot, so it
- * degenerates to exactly the old lerp.
- *
- * The value here is not the interpolation itself but `scheduleWaypoint`: it splices a future
- * waypoint into a trajectory that is already being consumed, without a discontinuity at the
- * current instant. That is what lets action chunks arriving at 10 Hz drive a 1 kHz loop that never
- * stops between them. Tangents are recomputed on every splice, so a waypoint added with no
- * successor is corrected once a later one gives it a neighbour on both sides.
+ * Trimming preserves the curve and its derivatives. Scheduled segments inherit entry velocity
+ * and end at their own secant velocity, keeping position and velocity continuous at splices.
+ * Reversing direction can therefore overshoot waypoint positions. Orientation is still slerp;
+ * angular velocity can step at waypoints. Outside the horizon, the endpoint is held.
  *
  * Evaluation is allocation-free and safe to call from a realtime update(). Splicing is not — build
  * the new interpolator off the realtime thread and hand it over.
@@ -60,9 +50,6 @@ class PoseTrajectoryInterpolator {
   double lastTime() const { return times_.back(); }
   std::size_t size() const { return times_.size(); }
 
-  /// The velocity (m/s) the position spline was built to hit exactly at waypoint `i`.
-  const Eigen::Vector3d& velocityAt(std::size_t i) const { return velocities_.at(i); }
-
   /// The sub-trajectory spanning [start_t, end_t], with both endpoints materialised as waypoints.
   PoseTrajectoryInterpolator trim(double start_t, double end_t) const;
 
@@ -73,9 +60,9 @@ class PoseTrajectoryInterpolator {
    * tail of the previous one while the part already being executed is left alone. A waypoint at or
    * before `curr_time` is ignored — it refers to an instant that has passed.
    *
-   * `max_pos_speed` / `max_rot_speed` stretch the segment's duration if reaching the waypoint on
-   * time would demand more than that, which bounds how far the reference can run away from the
-   * arm. UMI leaves both infinite; we do not, because that distance is what sets contact force.
+   * Speed limits stretch the new segment's duration to bound peak speed, not just average speed.
+   * If the positional limit is reduced below entry speed, that inherited speed bounds the
+   * transition and exit speed meets the new limit. Retained segments are not retimed.
    */
   PoseTrajectoryInterpolator scheduleWaypoint(const Pose& pose,
                                               double time,
@@ -88,6 +75,9 @@ class PoseTrajectoryInterpolator {
   std::vector<double> times_;
   std::vector<Pose> poses_;
   std::vector<Eigen::Vector3d> velocities_;
+
+  /// One-sided position derivative, including the clamped holds outside the horizon.
+  Eigen::Vector3d velocity(double t, bool from_left = false) const;
 
   /// (Re)derive velocities_ from times_/poses_. Called once, by both constructors.
   void computeVelocities();
